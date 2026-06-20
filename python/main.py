@@ -14,12 +14,17 @@ import numpy as np
 
 
 # ─── CONFIG DEFAULT ────────────────────────────────────────────────
-DEFAULT_METHOD      = "whitespace"   # "whitespace" | "fixed"
+DEFAULT_METHOD      = "auto"        # "whitespace" | "fixed" | "auto"
 DEFAULT_TOLERANCE   = 15             # 0=putih murni, maks ~60
 DEFAULT_MIN_HEIGHT  = 200            # tinggi minimum potongan (px)
+DEFAULT_MAX_HEIGHT  = 2000           # tinggi maksimum potongan (px)
 DEFAULT_FACTOR      = 1.4            # untuk fixed: tinggi = lebar × factor
 OUTPUT_FORMAT       = "jpg"          # "jpg" | "png"
 JPEG_QUALITY        = 92             # kualitas JPEG (1-100)
+
+# AUTO MODE: Threshold untuk deteksi text/bubble
+TEXT_VARIANCE_THRESHOLD = 35         # Baris dengan variance > ini = ada text
+SAFE_ZONE_MIN          = 5           # Minimal baris aman untuk cut
 # ────────────────────────────────────────────────────────────────────
 
 
@@ -90,12 +95,134 @@ def find_cuts_fixed(arr: np.ndarray, factor: float = 1.4):
     return cuts
 
 
+def calculate_row_variance(arr, y):
+    """Hitung variance warna per baris"""
+    row = arr[y].astype(float)
+    avg = row.mean(axis=0)
+    variance = ((row - avg) ** 2).mean()
+    return variance
+
+
+def is_row_text_or_bubble(arr, y, threshold):
+    """Deteksi apakah baris ini mengandung text atau bubble"""
+    row = arr[y].astype(float)
+    
+    # Hitung variance
+    avg = row.mean(axis=0)
+    variance = ((row - avg) ** 2).mean()
+    
+    # Edge detection: hitung perubahan mendadak
+    diff = np.abs(np.diff(row, axis=0)).sum(axis=1)
+    edge_count = (diff > 80).sum()
+    edge_ratio = edge_count / len(row)
+    
+    # Text detection
+    is_text = variance > threshold or edge_ratio > 0.3
+    return is_text, variance, edge_ratio
+
+
+def build_safety_map(arr, threshold):
+    """Bangun peta keamanan: True = aman (tidak ada text/bubble)"""
+    h, w, _ = arr.shape
+    safety_map = np.zeros(h, dtype=bool)
+    
+    for y in range(h):
+        is_text, _, _ = is_row_text_or_bubble(arr, y, threshold)
+        safety_map[y] = not is_text
+    
+    # Tambah margin keamanan
+    margin = 5
+    padded = safety_map.copy()
+    for y in range(h):
+        if not safety_map[y]:
+            start = max(0, y - margin)
+            end = min(h, y + margin + 1)
+            padded[start:end] = False
+    
+    return padded
+
+
+def find_cuts_auto(arr, min_height=200, max_height=2000, threshold=35):
+    """
+    Cari titik potong aman yang menghindari text/bubble.
+    Constraint:
+    - Tinggi antara min_height dan max_height
+    - Seluruh segmen harus aman (tidak ada text/bubble)
+    """
+    h, w, _ = arr.shape
+    
+    print(f"    Membangun peta keamanan...")
+    safety_map = build_safety_map(arr, threshold)
+    
+    # Hitung statistik
+    safe_rows = safety_map.sum()
+    safe_ratio = (safe_rows / h) * 100
+    print(f"    Area aman: {safe_rows}/{h} baris ({safe_ratio:.1f}%)")
+    
+    # Kelompokkan baris aman yang berurutan
+    safe_segments = []
+    seg_start = -1
+    
+    for y in range(h):
+        if safety_map[y]:
+            if seg_start == -1:
+                seg_start = y
+        else:
+            if seg_start != -1:
+                seg_len = y - seg_start
+                if seg_len >= SAFE_ZONE_MIN:
+                    safe_segments.append((seg_start, y - 1, seg_len))
+                seg_start = -1
+    
+    if seg_start != -1:
+        seg_len = h - seg_start
+        if seg_len >= SAFE_ZONE_MIN:
+            safe_segments.append((seg_start, h - 1, seg_len))
+    
+    print(f"    Area aman ditemukan: {len(safe_segments)} segmen")
+    
+    # Bangun potongan dari segmen aman
+    cuts = []
+    current_y = 0
+    
+    while current_y < h:
+        best_cut_y = None
+        target_y = min(current_y + max_height, h)
+        
+        # Cari segmen aman yang dekat target
+        for seg_start, seg_end, _ in safe_segments:
+            if seg_start >= current_y + min_height and seg_start <= target_y:
+                cut_candidate = (seg_start + seg_end) // 2
+                if current_y + min_height <= cut_candidate <= target_y:
+                    best_cut_y = cut_candidate
+                    break
+        
+        # Jika tidak ada, cari segmen terdekat setelah min_height
+        if best_cut_y is None:
+            for seg_start, seg_end, _ in safe_segments:
+                if seg_start >= current_y + min_height:
+                    best_cut_y = (seg_start + seg_end) // 2
+                    break
+        
+        # Jika masih tidak ada, ambil sisa gambar
+        if best_cut_y is None or best_cut_y >= h - SAFE_ZONE_MIN:
+            if h - current_y >= SAFE_ZONE_MIN:
+                cuts.append((current_y, h))
+            break
+        
+        cuts.append((current_y, best_cut_y))
+        current_y = best_cut_y
+    
+    return cuts
+
+
 def split_image(
     input_path: str,
     output_dir: str = None,
     method: str = DEFAULT_METHOD,
     tolerance: int = DEFAULT_TOLERANCE,
     min_height: int = DEFAULT_MIN_HEIGHT,
+    max_height: int = DEFAULT_MAX_HEIGHT,
     factor: float = DEFAULT_FACTOR,
     output_format: str = OUTPUT_FORMAT,
     jpeg_quality: int = JPEG_QUALITY,
@@ -124,8 +251,12 @@ def split_image(
     elif method == "fixed":
         print(f"[+] Metode: Fixed Ratio (faktor={factor}, tinggi per potongan≈{int(w*factor)}px)")
         cuts = find_cuts_fixed(arr, factor=factor)
+    elif method == "auto":
+        print(f"[+] Metode: AUTO (deteksi text/bubble, hindari saat cut)")
+        print(f"    Tinggi: min={min_height}px, max={max_height}px")
+        cuts = find_cuts_auto(arr, min_height=min_height, max_height=max_height, threshold=TEXT_VARIANCE_THRESHOLD)
     else:
-        raise ValueError(f"Metode tidak dikenal: {method}. Pilih 'whitespace' atau 'fixed'.")
+        raise ValueError(f"Metode tidak dikenal: {method}. Pilih 'whitespace', 'fixed', atau 'auto'.")
 
     if not cuts:
         print("[!] Tidak ditemukan titik potong. Coba naikkan toleransi atau turunkan min_height.")
@@ -161,12 +292,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("input", help="Path gambar input (PNG/JPG/WebP)")
     parser.add_argument("-o", "--output", default=None, help="Folder output (default: <nama_file>_split/)")
-    parser.add_argument("-m", "--method", default=DEFAULT_METHOD, choices=["whitespace", "fixed"],
-                        help="Metode deteksi (default: whitespace)")
+    parser.add_argument("-m", "--method", default=DEFAULT_METHOD, choices=["whitespace", "fixed", "auto"],
+                        help="Metode deteksi (default: auto)")
     parser.add_argument("-t", "--tolerance", type=int, default=DEFAULT_TOLERANCE,
                         help="Toleransi warna untuk whitespace (0-60, default: 15)")
     parser.add_argument("--min-height", type=int, default=DEFAULT_MIN_HEIGHT,
                         help="Tinggi minimum potongan px (default: 200)")
+    parser.add_argument("--max-height", type=int, default=DEFAULT_MAX_HEIGHT,
+                        help="Tinggi maksimum potongan px (default: 2000)")
     parser.add_argument("--factor", type=float, default=DEFAULT_FACTOR,
                         help="Faktor tinggi untuk metode fixed (default: 1.4)")
     parser.add_argument("--format", default=OUTPUT_FORMAT, choices=["jpg", "png"],
@@ -182,6 +315,7 @@ if __name__ == "__main__":
         method=args.method,
         tolerance=args.tolerance,
         min_height=args.min_height,
+        max_height=args.max_height,
         factor=args.factor,
         output_format=args.format,
         jpeg_quality=args.quality,

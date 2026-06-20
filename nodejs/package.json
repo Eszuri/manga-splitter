@@ -1,0 +1,13 @@
+{
+  "name": "manga-splitter",
+  "version": "1.0.0",
+  "description": "Potong gambar panjang (manga/webtoon) secara otomatis",
+  "main": "split.js",
+  "scripts": {
+    "split": "node split.js",
+    "help": "node split.js --help"
+  },
+  "dependencies": {
+    "sharp": "^0.33.0"
+  }
+}
