@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 /**
- * manga-splitter.js — AUTO MODE
- * Memotong gambar panjang (webtoon/manga) dengan method AUTO yang:
- *   - Bebas cut di manapun (0-2000px tinggi)
- *   - Deteksi text & bubble → TIDAK cut di area tersebut
- *   - Hanya cut di area "aman" (gap antar konten)
+ * manga-splitter.js — AUTO MODE v5
+ *
+ * Strategi baru: "Valley-aware cutting"
+ *
+ * 1. Hitung variance untuk setiap baris
+ * 2. Panel boundary (variance sangat rendah) = titik potong TERBAIK
+ * 3. "Valley" (local minimum variance) = titik potong BAGUS
+ * 4. Saat forced cut di maxHeight:
+ *    - Cari boundary/valley TERDEKAT ke maxHeight
+ *    - Jika tidak ada, cari area dengan variance TERENDAH
+ *    - Ini otomatis menghindari area kompleks (tempat text biasanya ada)
  *
  * Dependencies: npm install sharp
  */
@@ -13,8 +19,8 @@ const sharp = require("sharp");
 const path = require("path");
 const fs = require("fs");
 
-// ─── CONFIG DEFAULT ────────────────────────────────────────────────
-const DEFAULT_METHOD = "auto"; // "whitespace" | "fixed" | "auto"
+// ─── CONFIG ────────────────────────────────────────────────────────
+const DEFAULT_METHOD = "auto";
 const DEFAULT_TOLERANCE = 15;
 const DEFAULT_MIN_HEIGHT = 200;
 const DEFAULT_MAX_HEIGHT = 2000;
@@ -22,36 +28,22 @@ const DEFAULT_FACTOR = 1.4;
 const OUTPUT_FORMAT = "jpg";
 const JPEG_QUALITY = 92;
 
-// AUTO MODE: Threshold untuk deteksi text/bubble
-const TEXT_VARIANCE_THRESHOLD = 35; // Baris dengan variance > ini = ada text
-const BUBBLE_SCAN_MARGIN = 30; // Margin horizontal untuk deteksi bubble
-const SAFE_ZONE_THRESHOLD = 8; // Max "noise" di area potong (semakin kecil = semakin aman)
-const MIN_SAFE_ZONE = 5; // Minimal baris aman untuk cut
+// AUTO MODE
+const SOLID_ROW_THRESHOLD = 200;    // variance < ini = panel boundary
+const VALLEY_WINDOW = 50;           // Window untuk deteksi valley (px)
+const VALLEY_RATIO = 0.5;           // Valley = variance < 50% dari surrounding
+const MIN_VALLEY_DEPTH = 500;       // Minimal kedalaman valley (variance diff)
 // ────────────────────────────────────────────────────────────────────
 
-/**
- * Parse CLI arguments
- */
 function parseArgs() {
   const args = process.argv.slice(2);
-
-  if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
-    printHelp();
-    process.exit(0);
-  }
-
+  if (args.length === 0 || args.includes("--help") || args.includes("-h")) { printHelp(); process.exit(0); }
   const opts = {
-    input: null,
-    output: null,
-    method: DEFAULT_METHOD,
-    tolerance: DEFAULT_TOLERANCE,
-    minHeight: DEFAULT_MIN_HEIGHT,
-    maxHeight: DEFAULT_MAX_HEIGHT,
-    factor: DEFAULT_FACTOR,
-    format: OUTPUT_FORMAT,
-    quality: JPEG_QUALITY,
+    input: null, output: null, method: DEFAULT_METHOD,
+    tolerance: DEFAULT_TOLERANCE, minHeight: DEFAULT_MIN_HEIGHT,
+    maxHeight: DEFAULT_MAX_HEIGHT, factor: DEFAULT_FACTOR,
+    format: OUTPUT_FORMAT, quality: JPEG_QUALITY,
   };
-
   let positional = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i].startsWith("-")) {
@@ -64,297 +56,220 @@ function parseArgs() {
         case "--factor": opts.factor = parseFloat(args[++i]); break;
         case "--format": opts.format = args[++i]; break;
         case "--quality": opts.quality = parseInt(args[++i], 10); break;
-        default:
-          console.error(`[!] Flag tidak dikenal: ${args[i]}`);
-          process.exit(1);
+        default: console.error(`[!] Flag tidak dikenal: ${args[i]}`); process.exit(1);
       }
-    } else {
-      positional.push(args[i]);
-    }
+    } else { positional.push(args[i]); }
   }
-
-  if (positional.length === 0) {
-    console.error("[!] Input file wajib. Gunakan --help untuk bantuan.");
-    process.exit(1);
-  }
-
+  if (positional.length === 0) { console.error("[!] Input file wajib."); process.exit(1); }
   opts.input = positional[0];
   return opts;
 }
 
-/**
- * Print help message
- */
 function printHelp() {
   console.log(`
-manga-splitter — Potong gambar panjang dengan AUTO detection (hindari text/bubble)
+manga-splitter v5 — Valley-aware cutting
 
 PENGGUNAAN:
   node split.js <input> [opsi]
 
 METODE:
-  -m auto      Otomatis deteksi text/bubble, cut di area aman (default)
-  -m whitespace  Deteksi garis putih kosong
-  -m fixed      Potong dengan rasio tetap (tinggi = lebar × factor)
+  -m auto        Deteksi panel boundaries + valleys (default)
+  -m whitespace  Deteksi garis putih
+  -m fixed       Potong dengan rasio tetap
 
-OPSI UMUM:
-  -o, --output       Folder output (default: <nama>_split/)
-  -t, --tolerance    Toleransi warna untuk whitespace (default: 15)
-  --format           Format output: jpg | png (default: jpg)
-  --quality          Kualitas JPEG 1-100 (default: 92)
-
-OPSI METODE WHITESPACE/FIXED:
-  --min-height       Tinggi minimum potongan px (default: 200)
-  --factor           Faktor tinggi untuk fixed (default: 1.4)
-
-OPSI METODE AUTO:
-  --min-height       Tinggi minimum potongan px (default: 200)
-  --max-height       Tinggi maksimum potongan px (default: 2000)
+OPSI:
+  -o, --output       Folder output
+  --min-height       Tinggi minimum px (default: 200)
+  --max-height       Tinggi maksimum px (default: 2000)
+  --factor           Faktor fixed ratio (default: 1.4)
+  --format           Format: jpg | png (default: jpg)
+  --quality          Kualitas 1-100 (default: 92)
 
 CONTOH:
   node split.js manga.png
-  node split.js manga.png -m auto --max-height 1500
-  node split.js manga.png -m fixed --factor 1.5
-  node split.js manga.png -m whitespace -t 25
+  node split.js manga.png --max-height 1500
   `);
 }
 
-/**
- * Load image and extract raw pixel data
- */
 async function loadImage(inputPath) {
-  const image = sharp(inputPath);
-  const metadata = await image.metadata();
-  const { width, height, channels } = metadata;
-  const { data } = await image.raw().toBuffer({ resolveWithObject: true });
-  return { image, metadata, data: Buffer.from(data), width, height, channels };
+  const img = sharp(inputPath);
+  const meta = await img.metadata();
+  const { data } = await img.raw().toBuffer({ resolveWithObject: true });
+  return { data: Buffer.from(data), width: meta.width, height: meta.height, channels: meta.channels };
 }
 
-// ─── AUTO MODE: TEXT & BUBBLE DETECTION ────────────────────────────
+// ─── VARIANCE COMPUTATION ──────────────────────────────────────────
 
-/**
- * Hitung variance warna per baris
- * Variance tinggi = ada text/gambar kompleks
- * Variance rendah = area kosong / background solid
- */
-function calculateRowVariance(pixelData, y, width, channels) {
-  const rowOffset = y * width * channels;
-
-  // Hitung rata-rata RGB
-  let sumR = 0, sumG = 0, sumB = 0;
-  for (let x = 0; x < width; x++) {
-    const offset = rowOffset + x * channels;
-    sumR += pixelData[offset];
-    sumG += pixelData[offset + 1];
-    sumB += pixelData[offset + 2];
-  }
-  const avgR = sumR / width;
-  const avgG = sumG / width;
-  const avgB = sumB / width;
-
-  // Hitung variance
-  let varR = 0, varG = 0, varB = 0;
-  for (let x = 0; x < width; x++) {
-    const offset = rowOffset + x * channels;
-    varR += (pixelData[offset] - avgR) ** 2;
-    varG += (pixelData[offset + 1] - avgG) ** 2;
-    varB += (pixelData[offset + 2] - avgB) ** 2;
-  }
-
-  return (varR + varG + varB) / (width * 3);
-}
-
-/**
- * Deteksi apakah baris ini mengandung text atau bubble
- * Menggunakan kombinasi:
- *  1. Variance tinggi = kompleks (text, gambar)
- *  2. Edge detection = ada garis tepi (bubble border)
- */
-function isRowTextOrBubble(pixelData, y, width, channels, threshold) {
-  const variance = calculateRowVariance(pixelData, y, width, channels);
-
-  // Cek apakah ada edge mendadak (perubahan warna tajam)
-  let edgeCount = 0;
-  const rowOffset = y * width * channels;
-
-  for (let x = 1; x < width; x++) {
-    const prevOffset = rowOffset + (x - 1) * channels;
-    const currOffset = rowOffset + x * channels;
-
-    const diffR = Math.abs(pixelData[currOffset] - pixelData[prevOffset]);
-    const diffG = Math.abs(pixelData[currOffset + 1] - pixelData[prevOffset + 1]);
-    const diffB = Math.abs(pixelData[currOffset + 2] - pixelData[prevOffset + 2]);
-
-    if (diffR + diffG + diffB > 80) {
-      edgeCount++;
+function computeAllVariances(data, width, height, channels) {
+  const variances = new Float32Array(height);
+  for (let y = 0; y < height; y++) {
+    const off = y * width * channels;
+    let sR = 0, sG = 0, sB = 0;
+    for (let x = 0; x < width; x++) {
+      const o = off + x * channels;
+      sR += data[o]; sG += data[o + 1]; sB += data[o + 2];
     }
+    const aR = sR / width, aG = sG / width, aB = sB / width;
+    let vR = 0, vG = 0, vB = 0;
+    for (let x = 0; x < width; x++) {
+      const o = off + x * channels;
+      vR += (data[o] - aR) ** 2; vG += (data[o + 1] - aG) ** 2; vB += (data[o + 2] - aB) ** 2;
+    }
+    variances[y] = (vR + vG + vB) / (width * 3);
   }
-
-  // Rasio edge per lebar gambar
-  const edgeRatio = edgeCount / width;
-
-  // Text detection: variance tinggi ATAU banyak edge
-  const isText = variance > threshold || edgeRatio > 0.3;
-
-  return { isText, variance, edgeRatio };
+  return variances;
 }
 
+// ─── CUT POINT DETECTION ───────────────────────────────────────────
+
 /**
- * Bangun "peta keamanan" untuk setiap baris
- * true = aman (tidak ada text/bubble)
- * false = berbahaya (ada text/bubble)
+ * Cari semua "cut point candidates" dalam rentang [fromY, toY]:
+ *
+ * Tier 1: Panel boundary (variance < SOLID_ROW_THRESHOLD) → score tinggi
+ * Tier 2: Valley (local minimum dengan kedalaman signifikan) → score sedang
+ * Tier 3: Lowest variance row → score rendah
+ *
+ * Return: { y, score, type }
  */
-function buildSafetyMap(pixelData, width, height, channels, threshold) {
-  const safetyMap = new Array(height);
-  const varianceMap = new Float64Array(height);
+function findBestCutPoint(variances, fromY, toY, height) {
+  const candidates = [];
 
-  for (let y = 0; y < height; y++) {
-    const { isText, variance } = isRowTextOrBubble(
-      pixelData, y, width, channels, threshold
-    );
-    safetyMap[y] = !isText;
-    varianceMap[y] = variance;
-  }
+  for (let y = fromY; y <= toY && y < height; y++) {
+    const v = variances[y];
 
-  // Tambahkan margin keamanan di sekitar area text/bubble
-  const margin = 5;
-  const paddedSafetyMap = [...safetyMap];
+    // Tier 1: Panel boundary
+    if (v < SOLID_ROW_THRESHOLD) {
+      // Cari tengah region solid
+      let segStart = y;
+      while (segStart > fromY && variances[segStart - 1] < SOLID_ROW_THRESHOLD) segStart--;
+      let segEnd = y;
+      while (segEnd < toY && segEnd < height - 1 && variances[segEnd + 1] < SOLID_ROW_THRESHOLD) segEnd++;
+      const mid = Math.floor((segStart + segEnd) / 2);
+      candidates.push({ y: mid, score: 1000, type: "boundary", variance: v });
+      y = segEnd; // Skip rest of boundary
+      continue;
+    }
 
-  for (let y = 0; y < height; y++) {
-    if (!safetyMap[y]) {
-      // Tandai area sekitar sebagai tidak aman
-      for (let dy = -margin; dy <= margin; dy++) {
-        const ny = y + dy;
-        if (ny >= 0 && ny < height) {
-          paddedSafetyMap[ny] = false;
-        }
+    // Tier 2: Valley (local minimum)
+    if (y > VALLEY_WINDOW && y < height - VALLEY_WINDOW) {
+      // Cek apakah y adalah local minimum
+      const leftAvg = avgRange(variances, y - VALLEY_WINDOW, y - 1);
+      const rightAvg = avgRange(variances, y + 1, y + VALLEY_WINDOW);
+      const surroundingAvg = (leftAvg + rightAvg) / 2;
+
+      if (v < surroundingAvg * VALLEY_RATIO && (surroundingAvg - v) > MIN_VALLEY_DEPTH) {
+        // Cari tengah valley
+        let vStart = y;
+        while (vStart > fromY && variances[vStart - 1] < surroundingAvg * VALLEY_RATIO) vStart--;
+        let vEnd = y;
+        while (vEnd < toY && vEnd < height - 1 && variances[vEnd + 1] < surroundingAvg * VALLEY_RATIO) vEnd++;
+        const mid = Math.floor((vStart + vEnd) / 2);
+        const depth = surroundingAvg - variances[mid];
+        candidates.push({ y: mid, score: 500 + Math.min(depth / 10, 200), type: "valley", variance: v });
+        y = vEnd;
+        continue;
       }
     }
   }
 
-  return { safetyMap: paddedSafetyMap, varianceMap };
+  if (candidates.length === 0) {
+    // Tier 3: Cari row dengan variance terendah
+    let minV = Infinity, minY = toY;
+    for (let y = fromY; y <= toY && y < height; y++) {
+      if (variances[y] < minV) { minV = variances[y]; minY = y; }
+    }
+    candidates.push({ y: minY, score: 100, type: "lowest", variance: minV });
+  }
+
+  return candidates;
 }
 
-/**
- * Cari segmen-segmen aman yang cukup panjang untuk dijadikan potongan
- * Constraints:
- *  - Tinggi antara minHeight dan maxHeight
- *  - Seluruh segmen harus aman (tidak ada text/bubble)
- *  - Jika segmen terpotong text, cari titik terbaik di area aman
- */
-function findSafeCuts(safetyMap, height, minHeight, maxHeight) {
-  // Kelompokkan baris aman yang berurutan
-  const safeSegments = [];
-  let segStart = -1;
-
-  for (let y = 0; y < height; y++) {
-    if (safetyMap[y]) {
-      if (segStart === -1) segStart = y;
-    } else {
-      if (segStart !== -1) {
-        const segLen = y - segStart;
-        if (segLen >= MIN_SAFE_ZONE) {
-          safeSegments.push({ start: segStart, end: y - 1, length: segLen });
-        }
-        segStart = -1;
-      }
-    }
+function avgRange(arr, start, end) {
+  let sum = 0, count = 0;
+  for (let i = Math.max(0, start); i <= end && i < arr.length; i++) {
+    sum += arr[i]; count++;
   }
-  // Tambah segmen terakhir
-  if (segStart !== -1) {
-    const segLen = height - segStart;
-    if (segLen >= MIN_SAFE_ZONE) {
-      safeSegments.push({ start: segStart, end: height - 1, length: segLen });
-    }
-  }
+  return count > 0 ? sum / count : 0;
+}
 
-  console.log(`    Area aman ditemukan: ${safeSegments.length} segmen`);
+// ─── AUTO CUTTING v5 ───────────────────────────────────────────────
 
-  // Sekarang bangun potongan dari segmen aman
+function findAutoCuts(variances, height, minHeight, maxHeight) {
   const cuts = [];
   let currentY = 0;
+  let boundaryCount = 0, valleyCount = 0, lowestCount = 0;
 
   while (currentY < height) {
-    // Cari segmen aman berikutnya yang bisa dijadikan batas potong
-    let bestCutY = null;
+    const remaining = height - currentY;
 
-    // Prioritas: cari area aman yang memberikan potongan mendekati maxHeight
-    const targetY = Math.min(currentY + maxHeight, height);
-
-    // Cari segmen aman yang dekat target
-    for (const seg of safeSegments) {
-      if (seg.start >= currentY + minHeight && seg.start <= targetY) {
-        // Potong di tengah segmen ini
-        const cutCandidate = Math.floor((seg.start + seg.end) / 2);
-        if (cutCandidate >= currentY + minHeight && cutCandidate <= targetY) {
-          bestCutY = cutCandidate;
-          break; // Ambil yang pertama ditemukan (sudah terurut)
-        }
-      }
-    }
-
-    // Jika tidak ada segmen aman di target, cari segmen terdekat setelah minHeight
-    if (bestCutY === null) {
-      for (const seg of safeSegments) {
-        if (seg.start >= currentY + minHeight) {
-          bestCutY = Math.floor((seg.start + seg.end) / 2);
-          break;
-        }
-      }
-    }
-
-    // Jika masih tidak ada, potong di batas maksimum
-    if (bestCutY === null || bestCutY >= height - MIN_SAFE_ZONE) {
-      // Sisa gambar, ambil semua
-      if (height - currentY >= MIN_SAFE_ZONE) {
+    // Sisa ≤ minHeight → gabung ke potongan terakhir
+    if (remaining <= minHeight) {
+      if (cuts.length > 0) {
+        const last = cuts[cuts.length - 1];
+        cuts[cuts.length - 1] = [last[0], height];
+      } else {
         cuts.push([currentY, height]);
       }
       break;
     }
 
-    cuts.push([currentY, bestCutY]);
-    currentY = bestCutY;
+    // Target cut: maxHeight dari currentY
+    const target = Math.min(currentY + maxHeight, height);
+    // Search range: minHeight sampai maxHeight dari currentY
+    const searchFrom = currentY + minHeight;
+    const searchTo = Math.min(target, height - 1);
+
+    // Cari cut point candidates
+    const candidates = findBestCutPoint(variances, searchFrom, searchTo, height);
+
+    // Pilih candidate terbaik:
+    // Prioritas: score tertinggi, lalu paling dekat ke target
+    candidates.sort((a, b) => {
+      // Group by tier (score range)
+      const aTier = a.score >= 1000 ? 1 : a.score >= 500 ? 2 : 3;
+      const bTier = b.score >= 1000 ? 1 : b.score >= 500 ? 2 : 3;
+      if (aTier !== bTier) return aTier - bTier; // Lower tier number = better
+      // Same tier → prefer closer to target
+      return Math.abs(a.y - target) - Math.abs(b.y - target);
+    });
+
+    const best = candidates[0];
+
+    if (best.type === "boundary") boundaryCount++;
+    else if (best.type === "valley") valleyCount++;
+    else lowestCount++;
+
+    cuts.push([currentY, best.y]);
+    currentY = best.y;
   }
 
+  console.log(`    Cut points: ${boundaryCount} boundary, ${valleyCount} valley, ${lowestCount} lowest-variance`);
   return cuts;
 }
 
-// ─── EXISTING METHODS ──────────────────────────────────────────────
+// ─── OTHER METHODS ─────────────────────────────────────────────────
 
-function findCutsWhitespace(pixelData, width, height, channels, tolerance, minHeight) {
+function findCutsWhitespace(data, width, height, channels, tolerance, minHeight) {
   const solidRows = [];
   for (let y = 0; y < height; y++) {
-    const rowOffset = y * width * channels;
-    const refR = pixelData[rowOffset];
-    const refG = pixelData[rowOffset + 1];
-    const refB = pixelData[rowOffset + 2];
-    let isSolid = true;
-
+    const off = y * width * channels;
+    const rR = data[off], rG = data[off + 1], rB = data[off + 2];
+    let solid = true;
     for (let x = 1; x < width; x++) {
-      const offset = rowOffset + x * channels;
-      if (Math.abs(pixelData[offset] - refR) > tolerance ||
-          Math.abs(pixelData[offset + 1] - refG) > tolerance ||
-          Math.abs(pixelData[offset + 2] - refB) > tolerance) {
-        isSolid = false;
-        break;
+      const o = off + x * channels;
+      if (Math.abs(data[o] - rR) > tolerance || Math.abs(data[o + 1] - rG) > tolerance || Math.abs(data[o + 2] - rB) > tolerance) {
+        solid = false; break;
       }
     }
-    if (isSolid) solidRows.push(y);
+    if (solid) solidRows.push(y);
   }
-
   const cuts = [];
-  let start = 0;
-  let i = 0;
+  let start = 0, i = 0;
   while (i < solidRows.length) {
-    const solidStart = solidRows[i];
-    let j = i;
+    const s = solidRows[i]; let j = i;
     while (j + 1 < solidRows.length && solidRows[j + 1] === solidRows[j] + 1) j++;
-    const solidEnd = solidRows[j];
-    const cutY = Math.floor((solidStart + solidEnd) / 2);
-    if (cutY - start >= minHeight) {
-      cuts.push([start, cutY]);
-      start = solidEnd + 1;
-    }
+    const e = solidRows[j], cutY = Math.floor((s + e) / 2);
+    if (cutY - start >= minHeight) { cuts.push([start, cutY]); start = e + 1; }
     i = j + 1;
   }
   if (height - start >= minHeight) cuts.push([start, height]);
@@ -363,34 +278,21 @@ function findCutsWhitespace(pixelData, width, height, channels, tolerance, minHe
 
 function findCutsFixed(width, height, factor) {
   const sliceH = Math.max(1, Math.floor(width * factor));
-  const cuts = [];
-  let y = 0;
-  while (y < height) {
-    cuts.push([y, Math.min(y + sliceH, height)]);
-    y += sliceH;
-  }
+  const cuts = []; let y = 0;
+  while (y < height) { cuts.push([y, Math.min(y + sliceH, height)]); y += sliceH; }
   return cuts;
 }
 
-// ─── MAIN SPLIT FUNCTION ───────────────────────────────────────────
+// ─── MAIN ──────────────────────────────────────────────────────────
 
 async function splitImage(opts) {
   const inputPath = path.resolve(opts.input);
-  if (!fs.existsSync(inputPath)) {
-    console.error(`[!] File tidak ditemukan: ${inputPath}`);
-    process.exit(1);
-  }
+  if (!fs.existsSync(inputPath)) { console.error(`[!] File tidak ditemukan: ${inputPath}`); process.exit(1); }
 
   let outputDir = opts.output;
-  if (!outputDir) {
-    const basename = path.basename(inputPath, path.extname(inputPath));
-    outputDir = path.join(path.dirname(inputPath), basename + "_split");
-  }
+  if (!outputDir) outputDir = path.join(path.dirname(inputPath), path.basename(inputPath, path.extname(inputPath)) + "_split");
   outputDir = path.resolve(outputDir);
-
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
   console.log(`[+] Membaca gambar: ${inputPath}`);
   const { data, width, height, channels } = await loadImage(inputPath);
@@ -399,39 +301,27 @@ async function splitImage(opts) {
   let cuts = [];
 
   if (opts.method === "whitespace") {
-    console.log(`[+] Metode: Whitespace Detection (toleransi=${opts.tolerance})`);
+    console.log(`[+] Metode: Whitespace Detection`);
     cuts = findCutsWhitespace(data, width, height, channels, opts.tolerance, opts.minHeight);
-
   } else if (opts.method === "fixed") {
     console.log(`[+] Metode: Fixed Ratio (faktor=${opts.factor})`);
     cuts = findCutsFixed(width, height, opts.factor);
-
   } else if (opts.method === "auto") {
-    console.log(`[+] Metode: AUTO (deteksi text/bubble, hindari saat cut)`);
+    console.log(`[+] Metode: AUTO v5 (valley-aware cutting)`);
     console.log(`    Tinggi: min=${opts.minHeight}px, max=${opts.maxHeight}px`);
-    console.log(`    Membangun peta keamanan...`);
+    console.log(`    Menghitung variance per baris...`);
 
-    // Bangun peta keamanan
-    const { safetyMap, varianceMap } = buildSafetyMap(
-      data, width, height, channels, TEXT_VARIANCE_THRESHOLD
-    );
+    const variances = computeAllVariances(data, width, height, channels);
 
-    // Hitung statistik
-    let safeRows = 0;
-    for (let y = 0; y < height; y++) {
-      if (safetyMap[y]) safeRows++;
-    }
-    const safeRatio = ((safeRows / height) * 100).toFixed(1);
-    console.log(`    Area aman: ${safeRows}/${height} baris (${safeRatio}%)`);
+    // Statistik
+    let solidCount = 0;
+    for (let y = 0; y < height; y++) if (variances[y] < SOLID_ROW_THRESHOLD) solidCount++;
+    console.log(`    Solid rows: ${solidCount}/${height} (${((solidCount / height) * 100).toFixed(1)}%)`);
 
-    // Cari titik potong aman
-    cuts = findSafeCuts(safetyMap, height, opts.minHeight, opts.maxHeight);
+    cuts = findAutoCuts(variances, height, opts.minHeight, opts.maxHeight);
   }
 
-  if (cuts.length === 0) {
-    console.log("[!] Tidak ditemukan titik potong yang aman.");
-    return [];
-  }
+  if (cuts.length === 0) { console.log("[!] Tidak ditemukan titik potong."); return []; }
 
   console.log(`[+] Ditemukan ${cuts.length} potongan. Menyimpan ke: ${outputDir}`);
 
@@ -440,29 +330,23 @@ async function splitImage(opts) {
 
   for (let idx = 0; idx < cuts.length; idx++) {
     const [y0, y1] = cuts[idx];
+    const safeY1 = Math.min(y1, height);
+    if (safeY1 <= y0) continue;
     const fileName = `halaman_${String(idx + 1).padStart(3, "0")}.${ext}`;
     const filePath = path.join(outputDir, fileName);
-
     await sharp(inputPath)
-      .extract({ left: 0, top: y0, width, height: y1 - y0 })
+      .extract({ left: 0, top: y0, width, height: safeY1 - y0 })
       .toFormat(ext === "jpg" ? "jpeg" : ext, { quality: opts.quality })
       .toFile(filePath);
-
     saved.push(filePath);
-    console.log(`    [${String(idx + 1).padStart(3, "0")}] y=${y0}–${y1} (tinggi=${y1 - y0}px) → ${fileName}`);
+    console.log(`    [${String(idx + 1).padStart(3, "0")}] y=${y0}–${safeY1} (tinggi=${safeY1 - y0}px) → ${fileName}`);
   }
 
   console.log(`\n[✓] Selesai! ${saved.length} potongan tersimpan di: ${outputDir}`);
   return saved;
 }
 
-// ─── RUN ───────────────────────────────────────────────────────────
 (async () => {
-  try {
-    const opts = parseArgs();
-    await splitImage(opts);
-  } catch (err) {
-    console.error(`[✗] Error: ${err.message}`);
-    process.exit(1);
-  }
+  try { await splitImage(parseArgs()); }
+  catch (err) { console.error(`[✗] Error: ${err.message}`); process.exit(1); }
 })();
